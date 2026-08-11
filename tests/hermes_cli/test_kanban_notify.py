@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -30,9 +31,11 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert len(subs) == 1
     assert subs[0]["platform"] == "telegram"
     assert subs[0]["chat_id"] == "chat1"
+    assert subs[0]["chat_type"] == "dm"
     assert subs[0]["thread_id"] == "topic1"
     assert subs[0]["user_id"] == "user1"
     assert subs[0]["notifier_profile"] == "default"
+    assert subs[0]["delivery_metadata"] == {"direct_messages_topic_id": "topic1"}
 
 
 def test_create_task_inherits_parent_notify_subscriptions(kanban_home):
@@ -47,9 +50,13 @@ def test_create_task_inherits_parent_notify_subscriptions(kanban_home):
             thread_id="topic1",
             user_id="user1",
             notifier_profile="default",
+            chat_type="dm",
+            delivery_metadata={"direct_messages_topic_id": "topic1"},
         )
 
-        child = kb.create_task(conn, title="child", parents=[parent], assignee="worker1")
+        child = kb.create_task(
+            conn, title="child", parents=[parent], assignee="worker1"
+        )
 
         subs = kb.list_notify_subs(conn, child)
     finally:
@@ -58,7 +65,31 @@ def test_create_task_inherits_parent_notify_subscriptions(kanban_home):
     _assert_inherited_notify_sub(subs)
 
 
-def test_link_tasks_inherits_parent_notify_subscriptions_without_replaying_old_child_events(kanban_home):
+def test_multi_parent_notify_inheritance_uses_parent_list_precedence(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="first")
+        second = kb.create_task(conn, title="second")
+        for task_id, topic in ((first, "first-topic"), (second, "second-topic")):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="same-chat",
+                chat_type="dm",
+                delivery_metadata={"direct_messages_topic_id": topic},
+            )
+        child = kb.create_task(
+            conn, title="child", parents=[second, first], assignee="worker1"
+        )
+        subs = kb.list_notify_subs(conn, child)
+
+    assert len(subs) == 1
+    assert subs[0]["delivery_metadata"] == {"direct_messages_topic_id": "second-topic"}
+
+
+def test_link_tasks_inherits_parent_notify_subscriptions_without_replaying_old_child_events(
+    kanban_home,
+):
     conn = kb.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="worker1")
@@ -73,6 +104,8 @@ def test_link_tasks_inherits_parent_notify_subscriptions_without_replaying_old_c
             thread_id="topic1",
             user_id="user1",
             notifier_profile="default",
+            chat_type="dm",
+            delivery_metadata={"direct_messages_topic_id": "topic1"},
         )
 
         kb.link_tasks(conn, parent, child)
@@ -96,7 +129,9 @@ def test_link_tasks_inherits_parent_notify_subscriptions_without_replaying_old_c
 def test_decompose_triage_task_inherits_root_notify_subscriptions(kanban_home):
     conn = kb.connect()
     try:
-        root = kb.create_task(conn, title="triage root", triage=True, assignee="orchestrator")
+        root = kb.create_task(
+            conn, title="triage root", triage=True, assignee="orchestrator"
+        )
         kb.add_notify_sub(
             conn,
             task_id=root,
@@ -105,6 +140,8 @@ def test_decompose_triage_task_inherits_root_notify_subscriptions(kanban_home):
             thread_id="topic1",
             user_id="user1",
             notifier_profile="default",
+            chat_type="dm",
+            delivery_metadata={"direct_messages_topic_id": "topic1"},
         )
 
         child_ids = kb.decompose_triage_task(
@@ -182,7 +219,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ["gave_up", "crashed", "timed_out"])
+@pytest.mark.parametrize("kind", ["gave_up", "crashed", "timed_out"])
 async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     """
     Event kinds gave_up / crashed / timed_out send a notification but DO
@@ -231,7 +268,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    assert kind.replace("_", " ") in fake_adapter.send.call_args[0][1]
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
@@ -381,8 +418,10 @@ async def test_notifier_does_not_call_init_db(kanban_home):
         init_db_calls.append((args, kwargs))
         return real_init_db(*args, **kwargs)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
-         patch("hermes_cli.kanban_db.init_db", side_effect=_spy_init_db):
+    with (
+        patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep),
+        patch("hermes_cli.kanban_db.init_db", side_effect=_spy_init_db),
+    ):
         await asyncio.wait_for(
             runner._kanban_notifier_watcher(interval=1),
             timeout=10.0,
@@ -419,6 +458,7 @@ def test_dispatcher_tick_does_not_call_init_db(kanban_home, monkeypatch):
     # `_kanban_dispatcher_watcher`. Read the source and assert the
     # specific patterns that would reintroduce the bug are absent.
     import inspect
+
     src = inspect.getsource(GatewayRunner._kanban_dispatcher_watcher)
     assert "_kb.init_db(board=slug)" not in src, (
         "_kanban_dispatcher_watcher must not call _kb.init_db(board=slug) — "
@@ -449,6 +489,8 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
             platform="telegram",
             chat_id="chat1",
             notifier_profile="default",
+            chat_type="dm",
+            delivery_metadata={"direct_messages_topic_id": "topic1"},
         )
         kb.complete_task(conn, tid, result="done")
         # New subs start caught up at the creation-time MAX(task_events.id)
@@ -510,6 +552,8 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
             platform="telegram",
             chat_id="chat1",
             notifier_profile="default",
+            chat_type="dm",
+            delivery_metadata={"direct_messages_topic_id": "topic1"},
         )
         kb.complete_task(conn, tid, result="done")
     finally:
@@ -608,7 +652,9 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
 
 @pytest.mark.asyncio
-async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, monkeypatch):
+async def test_notifier_uploads_artifacts_on_completion(
+    kanban_home, tmp_path, monkeypatch
+):
     """When a completed event carries ``artifacts`` in its payload, the
     notifier uploads each file to the subscribed chat as a native
     attachment. Images batch through send_multiple_images; documents
@@ -643,6 +689,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     # Use the production handler so we exercise the full path: tool args
     # → metadata.artifacts → event payload promotion.
     import os
+
     os.environ["HERMES_KANBAN_TASK"] = tid
     try:
         out = kt._handle_complete({
@@ -652,6 +699,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
     import json as _json
+
     assert _json.loads(out)["ok"] is True
 
     runner = object.__new__(GatewayRunner)
@@ -681,6 +729,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     # extract_local_files is used internally for legacy path fallback;
     # the real BasePlatformAdapter implementation lives there, so wire it.
     from gateway.platforms.base import BasePlatformAdapter
+
     fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
 
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
@@ -705,7 +754,9 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
+async def test_notifier_artifact_delivery_skips_missing_files(
+    kanban_home, tmp_path, monkeypatch
+):
     """Missing artifact paths are silently skipped — they may have been
     referenced by name only. The notifier must not crash and must still
     deliver any artifacts that do exist."""
@@ -729,6 +780,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
         conn.close()
 
     import os
+
     os.environ["HERMES_KANBAN_TASK"] = tid
     try:
         kt._handle_complete({
@@ -757,6 +809,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     fake_adapter.send_document = AsyncMock(side_effect=_send_document)
     fake_adapter.send_multiple_images = AsyncMock()
     from gateway.platforms.base import BasePlatformAdapter
+
     fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
 
     runner.adapters = {Platform.TELEGRAM: fake_adapter}

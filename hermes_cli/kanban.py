@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
@@ -27,6 +28,9 @@ from typing import Any, Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1473,6 +1477,96 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maybe_add_default_notify_sub(
+    conn,
+    task_id: str,
+    *,
+    json_output: bool = False,
+    initial_event_id: Optional[int] = None,
+) -> bool:
+    """Subscribe CLI tasks to their bound origin, with optional fallback."""
+    try:
+        from gateway.session_context import get_session_env, session_env_is_bound
+        from hermes_cli.config import load_config
+
+        if json_output and session_env_is_bound("HERMES_SESSION_PLATFORM"):
+            return False
+
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) or {}
+        if not kanban_cfg.get("auto_subscribe_on_create", True):
+            return False
+
+        # The terminal tool bridges these ContextVars into subprocess env, so
+        # a CLI call made from Telegram/Discord can retain its exact origin.
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM") or "").strip().lower()
+        chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID") or "").strip()
+        chat_type = str(get_session_env("HERMES_SESSION_CHAT_TYPE") or "").strip() or None
+        thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID") or "").strip() or None
+        user_id = str(get_session_env("HERMES_SESSION_USER_ID") or "").strip() or None
+        message_id = str(get_session_env("HERMES_SESSION_MESSAGE_ID") or "").strip()
+        notifier_profile = (
+            str(get_session_env("HERMES_SESSION_PROFILE") or "").strip()
+            or str(os.environ.get("HERMES_PROFILE") or "").strip()
+            or get_active_profile_name()
+        )
+
+        if not platform or not chat_id:
+            raw = kanban_cfg.get("default_notify", {})
+            if not isinstance(raw, dict) or not raw.get("enabled", False):
+                return False
+            platform = str(raw.get("platform") or "").strip().lower()
+            chat_id = str(raw.get("chat_id") or "").strip()
+            chat_type = str(raw.get("chat_type") or "").strip() or None
+            thread_id = str(raw.get("thread_id") or "").strip() or None
+            user_id = str(raw.get("user_id") or "").strip() or None
+            notifier_profile = (
+                str(raw.get("notifier_profile") or "").strip()
+                or notifier_profile
+            )
+        if not platform or not chat_id:
+            return False
+
+        delivery_metadata: dict[str, Any] = {}
+        if thread_id:
+            delivery_metadata["thread_id"] = thread_id
+        if chat_type:
+            delivery_metadata["chat_type"] = chat_type
+        if (
+            platform == "telegram"
+            and thread_id
+            and (chat_type or "").lower() in {"dm", "direct", "private"}
+        ):
+            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+            if thread_id != "1":
+                delivery_metadata["direct_messages_topic_id"] = thread_id
+            if message_id:
+                delivery_metadata["telegram_reply_to_message_id"] = message_id
+
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_id=user_id,
+            notifier_profile=notifier_profile,
+            delivery_metadata=delivery_metadata or None,
+            initial_event_id=initial_event_id,
+        )
+        return True
+    except Exception:
+        # Notification bookkeeping must never make task creation fail, but the
+        # fallback loss must remain visible to operators.
+        logger.warning(
+            "could not auto-subscribe kanban task %s to completion notifications",
+            task_id,
+            exc_info=True,
+        )
+        return False
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1497,6 +1591,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
+        initial_event_id = int(
+            conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+        )
         task_id = kb.create_task(
             conn,
             title=args.title,
@@ -1520,6 +1617,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+        )
+        _maybe_add_default_notify_sub(
+            conn,
+            task_id,
+            json_output=bool(getattr(args, "json", False)),
+            initial_event_id=initial_event_id,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

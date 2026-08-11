@@ -864,6 +864,37 @@ def test_heartbeat_happy_path(worker_env):
     assert d["ok"] is True
 
 
+def test_heartbeat_writes_machine_readable_workspace_progress(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worker_env, workspace)
+    finally:
+        conn.close()
+
+    out = kt._handle_heartbeat({
+        "note": "page 4 of 9",
+        "phase": "fetching_reviews",
+        "token_class": "content",
+        "progress": {"pages_done": 4, "pages_total": 9},
+        "last_request_at": 123,
+        "next_allowed_at": 130,
+        "last_http_status": 200,
+        "last_error": None,
+    })
+    assert json.loads(out)["ok"] is True
+
+    status = json.loads((workspace / "status.json").read_text(encoding="utf-8"))
+    assert status["phase"] == "fetching_reviews"
+    assert status["token_class"] == "content"
+    assert status["progress"] == {"pages_done": 4, "pages_total": 9}
+    assert status["last_http_status"] == 200
+
+
 def test_heartbeat_without_note(worker_env):
     """note is optional."""
     from tools import kanban_tools as kt

@@ -331,6 +331,17 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def session_env_is_bound(name: str) -> bool:
+    """Return whether *name* is bound in this execution ContextVar.
+
+    Unlike :func:`session_context_engaged`, this is task-local and therefore
+    distinguishes an in-process gateway command from a CLI subprocess that
+    merely inherited the equivalent environment variables.
+    """
+    var = _VAR_MAP.get(name)
+    return var is not None and var.get() is not _UNSET
+
+
 def declare_stateless_channel() -> None:
     """Declare that this session cannot receive an async background completion.
 

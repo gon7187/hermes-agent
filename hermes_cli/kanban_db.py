@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -79,6 +80,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -146,6 +148,9 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+KANBAN_STATUS_MAX_BYTES = 1024 * 1024
+_SYSTEM_STATUS_ATTACHMENT_FILENAME = "__hermes_workspace_status_v1__.json"
+_SYSTEM_STATUS_ATTACHMENT_NAMESPACE = ".hermes-system-v1"
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -3286,23 +3291,22 @@ def _inherit_notify_subs(
         (child_id,),
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
-    placeholders = ",".join("?" * len(parent_ids))
-    conn.execute(
-        f"""
-        INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
-          FROM kanban_notify_subs
-         WHERE task_id IN ({placeholders})
-        """,
-        (
-            child_id,
-            int(created_at if created_at is not None else time.time()),
-            cursor,
-            *parent_ids,
-        ),
-    )
+    inherited_at = int(created_at if created_at is not None else time.time())
+    # Parent list order is the explicit precedence when destinations collide.
+    for parent_id in parent_ids:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, chat_type, thread_id, user_id,
+                 notifier_profile, delivery_metadata, created_at, last_event_id)
+            SELECT ?, platform, chat_id, chat_type, thread_id, user_id,
+                   notifier_profile, delivery_metadata, ?, ?
+              FROM kanban_notify_subs
+             WHERE task_id = ?
+             ORDER BY platform, chat_id, COALESCE(thread_id, '')
+            """,
+            (child_id, inherited_at, cursor, parent_id),
+        )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -4973,6 +4977,15 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+    # The DB completion is authoritative. Project and retain the final status
+    # only after it commits so rollback can never leave status.json at ``done``
+    # while the task remains ``running``. This system artifact is best-effort.
+    _finalize_completed_workspace_status(
+        conn,
+        task_id,
+        run_id=run_id,
+        completed_at=now,
+    )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5183,6 +5196,197 @@ def _persist_scratch_completion_artifacts(
         ]
 
 
+def _persist_scratch_status_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    content: bytes,
+    *,
+    created_at: int,
+) -> Optional[str]:
+    """Atomically upsert the single retained system status snapshot."""
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["workspace_kind"] != "scratch":
+        return None
+    if not row["workspace_path"]:
+        return None
+    workspace = Path(row["workspace_path"]).expanduser()
+    is_managed, board = _managed_scratch_path_info(workspace)
+    if not is_managed:
+        return None
+    attachment_dir = task_attachments_dir(task_id, board=board)
+    system_dir = attachment_dir / _SYSTEM_STATUS_ATTACHMENT_NAMESPACE
+    dest = system_dir / _SYSTEM_STATUS_ATTACHMENT_FILENAME
+    resolved = str(dest.absolute())
+    existing = conn.execute(
+        "SELECT id FROM task_attachments "
+        "WHERE task_id = ? AND filename = ? AND stored_path = ? "
+        "AND uploaded_by = 'kanban_complete' ORDER BY id",
+        (task_id, _SYSTEM_STATUS_ATTACHMENT_FILENAME, resolved),
+    ).fetchall()
+    attachments_base = attachments_root(board=board)
+    if attachment_dir != attachments_base / task_id:
+        raise ArtifactPreservationError("invalid task attachment directory")
+    attachments_base.mkdir(parents=True, exist_ok=True)
+    try:
+        with _open_owned_directory(attachments_base) as root_fd:
+            try:
+                task_dir_stat = os.stat(task_id, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                task_dir_stat = None
+            if task_dir_stat is None:
+                os.mkdir(task_id, mode=0o700, dir_fd=root_fd)
+            with _open_owned_directory_at(root_fd, task_id) as attachment_fd:
+                try:
+                    namespace_stat = os.stat(
+                        _SYSTEM_STATUS_ATTACHMENT_NAMESPACE,
+                        dir_fd=attachment_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    namespace_stat = None
+                if namespace_stat is None:
+                    os.mkdir(
+                        _SYSTEM_STATUS_ATTACHMENT_NAMESPACE,
+                        mode=0o700,
+                        dir_fd=attachment_fd,
+                    )
+                with _open_owned_directory_at(
+                    attachment_fd, _SYSTEM_STATUS_ATTACHMENT_NAMESPACE
+                ) as system_fd:
+                    tmp_name = (
+                        f".{_SYSTEM_STATUS_ATTACHMENT_FILENAME}."
+                        f"{os.getpid()}.{secrets.token_hex(4)}.tmp"
+                    )
+                    fd = os.open(
+                        tmp_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=system_fd,
+                    )
+                    try:
+                        written = 0
+                        while written < len(content):
+                            written += os.write(fd, content[written:])
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    try:
+                        os.replace(
+                            tmp_name,
+                            _SYSTEM_STATUS_ATTACHMENT_FILENAME,
+                            src_dir_fd=system_fd,
+                            dst_dir_fd=system_fd,
+                        )
+                        os.fsync(system_fd)
+                    finally:
+                        try:
+                            os.unlink(tmp_name, dir_fd=system_fd)
+                        except FileNotFoundError:
+                            pass
+    except Exception as exc:
+        raise ArtifactPreservationError(
+            f"could not preserve workspace status for {task_id}: {exc}"
+        ) from exc
+
+    if existing:
+        conn.execute(
+            "UPDATE task_attachments SET stored_path = ?, size = ?, created_at = ? "
+            "WHERE id = ?",
+            (resolved, len(content), created_at, existing[0]["id"]),
+        )
+    else:
+        _insert_completion_attachment(
+            conn,
+            task_id,
+            filename=_SYSTEM_STATUS_ATTACHMENT_FILENAME,
+            stored_path=resolved,
+            size=len(content),
+            created_at=created_at,
+        )
+    # Legacy status_N.json files are intentionally left untouched: attachment
+    # rows may store their exact paths, and retention is strictly no-delete.
+    return resolved
+
+
+def _record_status_preservation_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    error: Exception,
+) -> None:
+    """Best-effort explicit diagnostic for non-fatal final status failures."""
+    _log.warning("kanban final status preservation failed for %s: %s", task_id, error)
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "status_preservation_failed",
+                {"error": str(error)[:1000]},
+                run_id=run_id,
+            )
+    except Exception as diagnostic_error:  # pragma: no cover - defensive
+        _log.warning(
+            "could not record status preservation diagnostic for %s: %s",
+            task_id,
+            diagnostic_error,
+        )
+
+
+def _finalize_completed_workspace_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    completed_at: int,
+) -> None:
+    """Project committed completion and retain it without blocking completion."""
+    try:
+        with write_txn(conn):
+            final_status = _update_workspace_status(
+                conn,
+                task_id,
+                expected_task_status="done",
+                raise_on_error=True,
+                run_id=run_id,
+                status="done",
+                phase="completed",
+                completed_at=completed_at,
+                last_error=None,
+            )
+            if final_status is None:
+                return
+            status_artifact = _persist_scratch_status_snapshot(
+                conn,
+                task_id,
+                final_status,
+                created_at=completed_at,
+            )
+            if run_id is not None and status_artifact:
+                row = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                metadata = (
+                    json.loads(row["metadata"]) if row and row["metadata"] else {}
+                )
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["status_artifact"] = status_artifact
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (json.dumps(metadata, ensure_ascii=False), run_id),
+                )
+    except Exception as exc:
+        _record_status_preservation_failure(conn, task_id, run_id=run_id, error=exc)
+
+
 def _insert_completion_attachment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5211,7 +5415,11 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     """Return a non-conflicting path under ``directory`` for ``filename``."""
     safe_name = Path(filename).name or "artifact"
     candidate = directory / safe_name
-    if candidate not in used and not candidate.exists():
+    if (
+        candidate.name != _SYSTEM_STATUS_ATTACHMENT_NAMESPACE
+        and candidate not in used
+        and not candidate.exists()
+    ):
         return candidate
 
     stem = Path(safe_name).stem or "artifact"
@@ -6688,36 +6896,377 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
-def _ensure_workspace_status(task: Task, workspace: Path) -> None:
-    """Create the default worker status document without clobbering updates.
+def _validate_status_child_path(workspace: Path, status_path: Path) -> Path:
+    """Require the literal status child before opening the workspace itself."""
+    root = workspace.expanduser()
+    if status_path.expanduser() != root / "status.json":
+        raise ValueError("invalid status.json: path escapes workspace")
+    return root
 
-    Workers often need a small, durable status file before their first tool
-    call (for example, to publish a phase or checkpoint).  Creating it at
-    workspace resolution makes that contract true for every workspace kind,
-    while exclusive creation preserves a worker's existing status on retries.
-    """
-    status_path = workspace / "status.json"
-    if status_path.exists():
-        return
-    now = int(time.time())
-    payload = {
-        "schema_version": 1,
-        "task_id": task.id,
-        "status": task.status,
-        "phase": "workspace_ready",
-        "workspace_kind": task.workspace_kind or "scratch",
-        "workspace_path": str(workspace),
-        "created_at": now,
-        "updated_at": now,
-    }
+
+@contextlib.contextmanager
+def _open_owned_directory(path: Path):
+    """Open a pathname directory without following its final component."""
     try:
-        with status_path.open("x", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-    except FileExistsError:
-        # Another dispatcher/worker resolved the same workspace concurrently.
-        # The first writer owns the initial document; never overwrite it.
-        return
+        before = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"secure directory is unavailable: {exc}") from exc
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError("secure directory is not a regular directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("secure directory is not a regular directory")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("secure directory changed during open")
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            raise ValueError("secure directory has unexpected owner")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _open_owned_directory_at(parent_fd: int, name: str):
+    """Open one literal child directory relative to a trusted descriptor."""
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError("secure child is not a regular directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("secure child is not a regular directory")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("secure child changed during open")
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            raise ValueError("secure child has unexpected owner")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _open_workspace_directory(workspace: Path, status_path: Path):
+    """Open and identify one workspace directory for an entire status operation."""
+    root = _validate_status_child_path(workspace, status_path)
+    try:
+        before = os.lstat(root)
+    except OSError as exc:
+        raise ValueError(
+            f"invalid status.json: workspace is unavailable: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError("invalid status.json: workspace is not a directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dir_fd = os.open(root, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"invalid status.json: secure workspace open failed: {exc}"
+        ) from exc
+    try:
+        opened = os.fstat(dir_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("invalid status.json: workspace is not a directory")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError(
+                "invalid status.json: workspace changed during secure open"
+            )
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            raise ValueError("invalid status.json: unexpected workspace owner")
+        yield dir_fd
+    finally:
+        os.close(dir_fd)
+
+
+def _read_status_bytes_at(dir_fd: int) -> bytes:
+    """Read status.json relative to a verified workspace descriptor."""
+    try:
+        before = os.stat("status.json", dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"invalid status.json: unavailable: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("invalid status.json: not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open("status.json", flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ValueError(f"invalid status.json: secure open failed: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("invalid status.json: not a regular file")
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("invalid status.json: file changed during secure open")
+        if opened.st_nlink != 1:
+            raise ValueError("invalid status.json: unexpected hard-link count")
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            raise ValueError("invalid status.json: unexpected file owner")
+        if opened.st_size > KANBAN_STATUS_MAX_BYTES:
+            raise ValueError(
+                f"invalid status.json: exceeds {KANBAN_STATUS_MAX_BYTES}-byte size limit"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                fd,
+                max(1, min(1024 * 1024, KANBAN_STATUS_MAX_BYTES + 1 - total)),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > KANBAN_STATUS_MAX_BYTES:
+                raise ValueError(
+                    f"invalid status.json: exceeds {KANBAN_STATUS_MAX_BYTES}-byte size limit"
+                )
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _read_status_bytes(workspace: Path, status_path: Path) -> bytes:
+    """Read bounded status bytes anchored to one verified directory."""
+    with _open_workspace_directory(workspace, status_path) as dir_fd:
+        return _read_status_bytes_at(dir_fd)
+
+
+def _atomic_write_status_bytes_at(
+    dir_fd: int, content: bytes, *, replace_existing: bool
+) -> None:
+    """Publish status bytes using only operations relative to ``dir_fd``."""
+    tmp_name = f".status.json.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd: Optional[int] = None
+    try:
+        fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+        written = 0
+        while written < len(content):
+            written += os.write(fd, content[written:])
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        if replace_existing:
+            try:
+                current = os.stat("status.json", dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None and not stat.S_ISREG(current.st_mode):
+                raise ValueError("invalid status.json: not a regular file")
+            os.replace(
+                tmp_name,
+                "status.json",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+        else:
+            try:
+                os.link(
+                    tmp_name,
+                    "status.json",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                unsupported = {
+                    errno.EPERM,
+                    errno.EACCES,
+                    errno.EXDEV,
+                    getattr(errno, "ENOTSUP", -1),
+                    getattr(errno, "EOPNOTSUPP", -1),
+                }
+                if exc.errno not in unsupported:
+                    raise
+                direct_fd = os.open("status.json", flags, 0o600, dir_fd=dir_fd)
+                try:
+                    direct_written = 0
+                    while direct_written < len(content):
+                        direct_written += os.write(direct_fd, content[direct_written:])
+                    os.fsync(direct_fd)
+                except Exception:
+                    failed_name = (
+                        f".status.json.failed-{int(time.time())}-{secrets.token_hex(3)}"
+                    )
+                    try:
+                        os.replace(
+                            "status.json",
+                            failed_name,
+                            src_dir_fd=dir_fd,
+                            dst_dir_fd=dir_fd,
+                        )
+                    except OSError:
+                        pass
+                    raise
+                finally:
+                    os.close(direct_fd)
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_status_bytes(
+    workspace: Path,
+    status_path: Path,
+    content: bytes,
+    *,
+    replace_existing: bool = True,
+) -> None:
+    """Bounded same-directory replacement that never follows the destination."""
+    if len(content) > KANBAN_STATUS_MAX_BYTES:
+        raise ValueError(
+            f"status.json exceeds {KANBAN_STATUS_MAX_BYTES}-byte size limit"
+        )
+    with _open_workspace_directory(workspace, status_path) as dir_fd:
+        _atomic_write_status_bytes_at(
+            dir_fd, content, replace_existing=replace_existing
+        )
+
+
+def _decode_workspace_status(task_id: str, content: bytes) -> dict:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"invalid status.json for task {task_id}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"invalid status.json for task {task_id}: root is not an object"
+        )
+    existing_task_id = payload.get("task_id")
+    if existing_task_id != task_id:
+        raise ValueError(
+            f"status.json for task {task_id} belongs to task {existing_task_id!r}"
+        )
+    return payload
+
+
+def _encode_workspace_status(payload: dict) -> bytes:
+    content = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(content) > KANBAN_STATUS_MAX_BYTES:
+        raise ValueError(
+            f"status.json exceeds {KANBAN_STATUS_MAX_BYTES}-byte size limit"
+        )
+    return content
+
+
+def _validate_workspace_status(task: Task, status_path: Path) -> None:
+    """Reject malformed, unsafe, oversized, or cross-task status documents."""
+    content = _read_status_bytes(status_path.parent, status_path)
+    _decode_workspace_status(task.id, content)
+
+
+def _ensure_workspace_status(task: Task, workspace: Path) -> None:
+    """Create or refresh status using one verified workspace descriptor."""
+    status_path = workspace / "status.json"
+    now = int(time.time())
+    with _open_workspace_directory(workspace, status_path) as dir_fd:
+        try:
+            content = _read_status_bytes_at(dir_fd)
+        except ValueError as exc:
+            if not isinstance(exc.__cause__, FileNotFoundError):
+                raise
+            content = None
+        if content is not None:
+            payload = _decode_workspace_status(task.id, content)
+            # Plain reuse preserves worker-owned documents byte-for-byte.
+            if task.current_run_id is None:
+                return
+            payload["schema_version"] = 1
+            payload["task_id"] = task.id
+            payload["run_id"] = task.current_run_id
+            payload["status"] = task.status
+            payload["updated_at"] = now
+            _atomic_write_status_bytes_at(
+                dir_fd, _encode_workspace_status(payload), replace_existing=True
+            )
+            return
+        payload = {
+            "schema_version": 1,
+            "task_id": task.id,
+            "run_id": task.current_run_id,
+            "status": task.status,
+            "phase": "workspace_ready",
+            "workspace_kind": task.workspace_kind or "scratch",
+            "workspace_path": str(workspace),
+            "token_class": None,
+            "progress": {},
+            "last_request_at": None,
+            "next_allowed_at": None,
+            "last_http_status": None,
+            "last_error": None,
+            "last_heartbeat_at": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            _atomic_write_status_bytes_at(
+                dir_fd,
+                _encode_workspace_status(payload),
+                replace_existing=False,
+            )
+        except FileExistsError:
+            _decode_workspace_status(task.id, _read_status_bytes_at(dir_fd))
+
+
+_STATUS_UNSET = object()
+
+
+def _update_workspace_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_task_status: Optional[str] = None,
+    expected_run_id: Any = _STATUS_UNSET,
+    raise_on_error: bool = False,
+    **updates: Any,
+) -> Optional[bytes]:
+    """Merge and return exact published bytes using one verified directory."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    if expected_task_status is not None and task.status != expected_task_status:
+        return None
+    if expected_run_id is not _STATUS_UNSET and task.current_run_id != expected_run_id:
+        return None
+    if task.workspace_path:
+        workspace = Path(task.workspace_path).expanduser()
+    elif (task.workspace_kind or "scratch") == "scratch":
+        workspace = workspaces_root() / task.id
+    else:
+        return None
+    status_path = workspace / "status.json"
+    try:
+        with _open_workspace_directory(workspace, status_path) as dir_fd:
+            payload = _decode_workspace_status(task_id, _read_status_bytes_at(dir_fd))
+            payload["schema_version"] = 1
+            payload["task_id"] = task_id
+            for key, value in updates.items():
+                if value is not _STATUS_UNSET:
+                    payload[key] = value
+            payload["updated_at"] = int(time.time())
+            final_content = _encode_workspace_status(payload)
+            _atomic_write_status_bytes_at(dir_fd, final_content, replace_existing=True)
+    except (OSError, ValueError) as exc:
+        if raise_on_error:
+            raise ArtifactPreservationError(
+                f"could not project workspace status for {task_id}: {exc}"
+            ) from exc
+        _log.warning("kanban status update skipped for %s: %s", task_id, exc)
+        return None
+    return final_content
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
@@ -7264,6 +7813,13 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    phase: Any = _STATUS_UNSET,
+    token_class: Any = _STATUS_UNSET,
+    progress: Any = _STATUS_UNSET,
+    last_request_at: Any = _STATUS_UNSET,
+    next_allowed_at: Any = _STATUS_UNSET,
+    last_http_status: Any = _STATUS_UNSET,
+    last_error: Any = _STATUS_UNSET,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -7301,6 +7857,22 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+        _update_workspace_status(
+            conn,
+            task_id,
+            expected_task_status="running",
+            expected_run_id=run_id,
+            run_id=run_id,
+            status="running",
+            phase=phase,
+            token_class=token_class,
+            progress=progress,
+            last_request_at=last_request_at,
+            next_allowed_at=next_allowed_at,
+            last_http_status=last_http_status,
+            last_error=last_error,
+            last_heartbeat_at=now,
+        )
         _append_event(
             conn,
             task_id,
@@ -8717,6 +9289,7 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
                     claimed, board=board
                 )
+                _ensure_workspace_status(claimed, workspace)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -8822,6 +9395,7 @@ def _dispatch_once_locked(
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
                     claimed, board=board
                 )
+                _ensure_workspace_status(claimed, workspace)
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -9813,6 +10387,7 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    initial_event_id: Optional[int] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
@@ -9829,13 +10404,20 @@ def add_notify_sub(
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     with write_txn(conn):
+        if initial_event_id is None:
+            cursor_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            cursor = int(cursor_row["cursor"] if cursor_row is not None else 0)
+        else:
+            cursor = max(0, int(initial_event_id))
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
                  notifier_profile, delivery_metadata, created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -9847,7 +10429,7 @@ def add_notify_sub(
                 notifier_profile,
                 metadata_json,
                 now,
-                task_id,
+                cursor,
             ),
         )
         if chat_type:

@@ -1040,6 +1040,156 @@ def test_cli_notify_subscribe_and_list(kanban_home):
     assert "Unsubscribed" in rm
 
 
+def test_cli_create_auto_subscribes_configured_default_destination(kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  default_notify:\n"
+        "    enabled: true\n"
+        "    platform: telegram\n"
+        "    chat_id: '665337735'\n"
+        "    chat_type: dm\n"
+        "    notifier_profile: default\n",
+        encoding="utf-8",
+    )
+
+    created = json.loads(run_slash("create 'notify me' --json"))
+    subscriptions = json.loads(run_slash(f"notify-list {created['id']} --json"))
+
+    assert len(subscriptions) == 1
+    sub = subscriptions[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "665337735"
+    assert sub["chat_type"] == "dm"
+    assert sub["notifier_profile"] == "default"
+
+
+def test_cli_create_auto_subscribes_bound_gateway_origin(kanban_home, monkeypatch):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  default_notify:\n"
+        "    enabled: true\n"
+        "    platform: telegram\n"
+        "    chat_id: fallback-chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "origin-chat")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "77")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "9001")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
+
+    created = json.loads(run_slash("create 'origin notify' --json"))
+    subscriptions = json.loads(run_slash(f"notify-list {created['id']} --json"))
+
+    assert len(subscriptions) == 1
+    sub = subscriptions[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "origin-chat"
+    assert sub["thread_id"] == "77"
+    assert sub["user_id"] == "user-1"
+    assert sub["chat_type"] == "dm"
+    assert sub["delivery_metadata"]["telegram_reply_to_message_id"] == "9001"
+
+
+def test_cli_create_respects_disabled_auto_subscribe(kanban_home, monkeypatch):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: false\n"
+        "  default_notify:\n"
+        "    enabled: true\n"
+        "    platform: telegram\n"
+        "    chat_id: fallback-chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "origin-chat")
+
+    created = json.loads(run_slash("create 'no notify' --json"))
+    subscriptions = json.loads(run_slash(f"notify-list {created['id']} --json"))
+    assert subscriptions == []
+
+
+def test_cli_create_partial_origin_uses_configured_fallback(kanban_home, monkeypatch):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  default_notify:\n"
+        "    enabled: true\n"
+        "    platform: telegram\n"
+        "    chat_id: fallback-chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+
+    created = json.loads(run_slash("create 'fallback notify' --json"))
+    subscriptions = json.loads(run_slash(f"notify-list {created['id']} --json"))
+    assert len(subscriptions) == 1
+    assert subscriptions[0]["chat_id"] == "fallback-chat"
+
+
+def test_cli_create_logs_auto_subscribe_failure(kanban_home, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "origin-chat")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("subscription database unavailable")
+
+    monkeypatch.setattr(kb, "add_notify_sub", boom)
+    with caplog.at_level("WARNING"):
+        created = json.loads(run_slash("create 'still created' --json"))
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, created["id"]) is not None
+    assert "could not auto-subscribe" in caplog.text
+
+
+def test_cli_auto_subscribe_cursor_does_not_miss_fast_completion(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli.kanban import _maybe_add_default_notify_sub
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "origin-chat")
+    with kb.connect() as conn:
+        before_create = int(
+            conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+        )
+        task_id = kb.create_task(conn, title="instant")
+        assert kb.complete_task(conn, task_id, result="done")
+        completed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ][-1]
+        assert completed.id > before_create
+
+        assert _maybe_add_default_notify_sub(
+            conn, task_id, initial_event_id=before_create
+        )
+        sub = kb.list_notify_subs(conn, task_id)[0]
+
+    assert sub["last_event_id"] == before_create
+    assert sub["last_event_id"] < completed.id
+
+
+def test_in_process_gateway_json_create_does_not_auto_subscribe(kanban_home):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli.kanban import _maybe_add_default_notify_sub
+
+    tokens = set_session_vars(platform="telegram", chat_id="origin-chat")
+    try:
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="scripted gateway create")
+            assert not _maybe_add_default_notify_sub(
+                conn, task_id, json_output=True
+            )
+            assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        del tokens
+        reset_session_vars()
+
+
 def test_cli_log_missing_task(kanban_home):
     # No such task → exit-style (no log for...) message on stderr, returned
     # in combined output.

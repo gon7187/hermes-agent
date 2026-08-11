@@ -835,6 +835,13 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                phase=args.get("phase", kb._STATUS_UNSET),
+                token_class=args.get("token_class", kb._STATUS_UNSET),
+                progress=args.get("progress", kb._STATUS_UNSET),
+                last_request_at=args.get("last_request_at", kb._STATUS_UNSET),
+                next_allowed_at=args.get("next_allowed_at", kb._STATUS_UNSET),
+                last_http_status=args.get("last_http_status", kb._STATUS_UNSET),
+                last_error=args.get("last_error", kb._STATUS_UNSET),
             )
             if not ok:
                 return tool_error(
@@ -1693,6 +1700,23 @@ KANBAN_HEARTBEAT_SCHEMA = {
                     "Shown in the event log."
                 ),
             },
+            "phase": {
+                "type": "string",
+                "description": "Machine-readable phase written to workspace/status.json.",
+            },
+            "token_class": {
+                "type": ["string", "null"],
+                "description": "Optional credential/token class currently in use.",
+            },
+            "progress": {
+                "type": "object",
+                "description": "Structured counters such as pages_done/pages_total.",
+                "additionalProperties": True,
+            },
+            "last_request_at": {"type": ["integer", "null"]},
+            "next_allowed_at": {"type": ["integer", "null"]},
+            "last_http_status": {"type": ["integer", "null"]},
+            "last_error": {"type": ["string", "null"]},
             "board": _board_schema_prop(),
         },
         "required": [],

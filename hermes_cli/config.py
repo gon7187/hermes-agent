@@ -2989,6 +2989,18 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Optional fallback destination for tasks created by headless CLI
+        # invocations, where no gateway/TUI origin context exists. Disabled by
+        # default to avoid surprising deliveries on shared installations.
+        "default_notify": {
+            "enabled": False,
+            "platform": "",
+            "chat_id": "",
+            "chat_type": "",
+            "thread_id": "",
+            "user_id": "",
+            "notifier_profile": "",
+        },
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
