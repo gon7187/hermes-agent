@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -2111,6 +2112,31 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     assert ws.exists()
     assert ws.is_dir()
     assert "kanban" in str(ws)
+    status_path = ws / "status.json"
+    assert status_path.is_file()
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["schema_version"] == 1
+    assert status["task_id"] == t
+    assert status["phase"] == "workspace_ready"
+    assert status["workspace_path"] == str(ws)
+
+
+def test_workspace_status_is_not_overwritten_on_reuse(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        status_path = ws / "status.json"
+        status_path.write_text(
+            json.dumps({"phase": "worker_checkpoint", "pages": 3}),
+            encoding="utf-8",
+        )
+        kb.resolve_workspace(task)
+    assert json.loads(status_path.read_text(encoding="utf-8")) == {
+        "phase": "worker_checkpoint",
+        "pages": 3,
+    }
 
 
 def test_dir_workspace_honors_given_path(kanban_home, tmp_path):

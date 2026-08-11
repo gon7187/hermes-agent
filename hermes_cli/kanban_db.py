@@ -6688,6 +6688,38 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _ensure_workspace_status(task: Task, workspace: Path) -> None:
+    """Create the default worker status document without clobbering updates.
+
+    Workers often need a small, durable status file before their first tool
+    call (for example, to publish a phase or checkpoint).  Creating it at
+    workspace resolution makes that contract true for every workspace kind,
+    while exclusive creation preserves a worker's existing status on retries.
+    """
+    status_path = workspace / "status.json"
+    if status_path.exists():
+        return
+    now = int(time.time())
+    payload = {
+        "schema_version": 1,
+        "task_id": task.id,
+        "status": task.status,
+        "phase": "workspace_ready",
+        "workspace_kind": task.workspace_kind or "scratch",
+        "workspace_path": str(workspace),
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        with status_path.open("x", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+    except FileExistsError:
+        # Another dispatcher/worker resolved the same workspace concurrently.
+        # The first writer owns the initial document; never overwrite it.
+        return
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -6729,6 +6761,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         else:
             p = workspaces_root(board=board) / task.id
         p.mkdir(parents=True, exist_ok=True)
+        _ensure_workspace_status(task, p)
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -6743,9 +6776,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
         p.mkdir(parents=True, exist_ok=True)
+        _ensure_workspace_status(task, p)
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        _ensure_workspace_status(task, p)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
